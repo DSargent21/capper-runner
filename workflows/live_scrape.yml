@@ -1,0 +1,117 @@
+name: Live Scraper
+
+on:
+  schedule:
+    # 8 peak-aligned runs/day (plan 2026-10, D2). Times in comments = ET.
+    - cron: '7 9,12,15,17,19,21 * * *'  # 05:00, 08:00, 11:00, 13:00, 15:00, 17:00
+    - cron: '7 0 * * *'                  # 20:00
+    - cron: '37 2 * * *'                 # 22:30
+  workflow_dispatch:
+
+concurrency:
+  group: daily-scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      GEMINI_TOKEN: ${{ secrets.GEMINI_TOKEN }}
+      JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+      BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+      TWITTER_USERNAME: ${{ secrets.TWITTER_USERNAME }}
+      TWITTER_EMAIL: ${{ secrets.TWITTER_EMAIL }}
+      TWITTER_PASSWORD: ${{ secrets.TWITTER_PASSWORD }}
+      TWITTER_AUTH_TOKEN: ${{ secrets.TWITTER_AUTH_TOKEN }}
+      TWITTER_CT0: ${{ secrets.TWITTER_CT0 }}
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      TELEGRAM_PHONE: ${{ secrets.TELEGRAM_PHONE }}
+      TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+    steps:
+      - name: Checkout Runner Repo
+        uses: actions/checkout@v4
+
+      - name: Verify + unseal pipeline bundle
+        env:
+          PIPELINE_SEAL_KEY: ${{ secrets.PIPELINE_SEAL_KEY }}
+        run: |
+          cd bundles && sha256sum -c SHA256
+          python3 -m pip install --user -q cryptography
+          python3 tools/unseal.py --in bundles/pipeline.seal --out /tmp/pipeline.tgz
+          mkdir -p pipeline
+          tar xzf /tmp/pipeline.tgz -C pipeline
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: pipeline/requirements.txt
+
+      - name: Restore venv cache
+        id: venv-cache
+        uses: actions/cache@v4
+        with:
+          path: pipeline/.venv
+          key: venv-${{ runner.os }}-${{ hashFiles('pipeline/requirements.txt') }}
+
+      - name: Restore pipeline state (caches + learned memory)
+        uses: actions/cache@v4
+        with:
+          path: |
+            pipeline/.vision_cache.json
+            pipeline/.text_cache.json
+            pipeline/.grounded_cache.json
+            pipeline/.jina_evidence_cache.json
+            pipeline/.grading_results_cache.json
+            pipeline/grading_resolution_cache.json
+            pipeline/grading_evidence_cache.json
+            pipeline/.agent/gemini_usage.json
+            pipeline/.agent/capper_variants.json
+            pipeline/cache/attribution_memory.json
+            pipeline/cache/pipeline_incremental.json
+            pipeline/cache/quota_ledger.json
+            pipeline/cache/dead_letter.json
+            pipeline/cache/heartbeat.json
+          key: pipeline-state-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            pipeline-state-${{ runner.os }}-
+
+      - name: Install Dependencies
+        if: steps.venv-cache.outputs.cache-hit != 'true'
+        working-directory: pipeline
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+
+      - name: Replay dead-letter uploads
+        continue-on-error: true
+        working-directory: pipeline
+        run: .venv/bin/python scripts/replay_dead_letter.py || true
+
+      - name: Quota governor (mode gate)
+        id: gov
+        working-directory: pipeline
+        run: .venv/bin/python scripts/quota_governor.py decide --job live
+
+      - name: Run Live Scraper
+        if: steps.gov.outputs.run == 'true'
+        working-directory: pipeline
+        run: .venv/bin/python cli.py --live --source all --incremental
+
+      - name: Record heartbeat
+        if: always()
+        working-directory: pipeline
+        run: |
+          .venv/bin/python scripts/record_heartbeat.py --job live-scrape \
+            --status "${{ job.status }}" --detail "live run ${{ github.run_id }}"

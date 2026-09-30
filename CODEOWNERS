@@ -1,0 +1,2 @@
+# The workflows are the real attack surface: only the owner may change them.
+.github/** @DSargent21
