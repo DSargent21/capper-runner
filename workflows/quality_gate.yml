@@ -31,7 +31,7 @@ jobs:
         env:
           PIPELINE_SEAL_KEY: ${{ secrets.PIPELINE_SEAL_KEY }}
         run: |
-          cd bundles && sha256sum -c SHA256
+          (cd bundles && sha256sum -c SHA256)
           python3 -m pip install --user -q cryptography
           python3 tools/unseal.py --in bundles/pipeline.seal --out /tmp/pipeline.tgz
           mkdir -p pipeline
