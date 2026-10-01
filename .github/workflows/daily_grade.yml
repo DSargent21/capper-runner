@@ -13,6 +13,10 @@ on:
         description: 'Max dates to process this run (0 = unlimited). Used with drain.'
         type: number
         default: 0
+      chain:
+        description: 'Internal autopilot counter: how many drain runs have chained so far (0 = manual).'
+        type: number
+        default: 0
 
 concurrency:
   group: grader
@@ -22,6 +26,9 @@ jobs:
   grade:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: write   # drain autopilot: dispatch the next chained run
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -84,7 +91,36 @@ jobs:
               ARGS="$ARGS --max-dates $MAXD"
             fi
           fi
-          .venv/bin/python scripts/grade_pending.py $ARGS
+          .venv/bin/python scripts/grade_pending.py $ARGS | tee grade_output.txt
+
+      - name: Drain autopilot — chain the next run while the backlog survives
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.drain == 'true' }}
+        working-directory: pipeline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          CHAIN: ${{ github.event.inputs.chain }}
+        run: |
+          # A backlog this size is hours of free-minutes grading, not one run.
+          # Keep the chain alive while real progress is still being made, and
+          # stop on: empty backlog (count excludes TODAY — live-day picks are
+          # legitimately pending until tomorrow), a run that moved almost
+          # nothing (upstream quota walls; hammering re-pays 429s for nothing),
+          # or a 24-link depth cap (~30h worst case).
+          MOVED=$(grep -oE 'Graded: [0-9]+ \| Sent to needs_review: [0-9]+' grade_output.txt | tail -1 | grep -oE '[0-9]+' | paste -sd+ | bc 2>/dev/null || echo 0)
+          [ -z "$MOVED" ] && MOVED=0
+          DEPTH=${CHAIN:-0}
+          TODAY=$(date -u +%F)
+          CNT=$(curl -s -G "$SUPABASE_URL/rest/v1/picks" -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" -H "Prefer: count=exact" --data-urlencode "select=id" --data-urlencode "status=eq.pending_grading" --data-urlencode "pick_date=lt.$TODAY" -o /dev/null -D - | tr -d '\r' | awk -F'/ ' '/[Cc]ontent-[Rr]ange/ {print $2}')
+          case "$CNT" in ''|*[!0-9]*) CNT=0;; esac
+          echo "moved=$MOVED pending_before_today=$CNT chain_depth=$DEPTH"
+          if [ "$CNT" -gt 0 ] && [ "$MOVED" -ge 25 ] && [ "$DEPTH" -lt 24 ]; then
+            gh workflow run "Daily Grader" -R "$GITHUB_REPOSITORY" -f drain=true -f max_dates=0 -f chain=$((DEPTH+1))
+            echo "✅ queued next drain (chain $((DEPTH+1))/24): $CNT picks remain"
+          else
+            echo "🛑 drain chain stops here (backlog $CNT, moved $MOVED, depth $DEPTH)"
+          fi
 
       - name: Golden canary (deterministic drift check)
         if: always()
