@@ -74,7 +74,11 @@ jobs:
         run: |
           ARGS="--yesterday --review --review-window 3"
           if [ "${{ github.event.inputs.drain }}" = "true" ]; then
-            ARGS="--drain"
+            # --budget 4800: self-stop at 80 min, inside the 90-min job
+            # timeout. A hard kill mid-date loses that date's graded batch
+            # (update_grade_status commits per date); a budget stop finishes
+            # the date, writes, and leaves the rest for the next dispatch.
+            ARGS="--drain --budget 4800"
             MAXD="${{ github.event.inputs.max_dates }}"
             if [ "$MAXD" != "0" ] && [ -n "$MAXD" ]; then
               ARGS="$ARGS --max-dates $MAXD"
