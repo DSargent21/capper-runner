@@ -55,6 +55,7 @@ jobs:
           tar xzf /tmp/pipeline.tgz -C pipeline
 
       - name: Set up Python 3.12
+        id: setup-python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -66,15 +67,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: pipeline/.venv
-          key: venv-${{ runner.os }}-${{ hashFiles('pipeline/requirements.txt') }}
+          key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('pipeline/requirements.txt') }}
 
       - name: Install Dependencies
-        if: steps.venv-cache.outputs.cache-hit != 'true'
         working-directory: pipeline
         run: |
-          python -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install -r requirements.txt
+          if [ ! -f .venv/bin/python ] || ! .venv/bin/python -c "import sys" 2>/dev/null; then
+            echo "Virtual environment missing or broken, rebuilding..."
+            rm -rf .venv
+            python -m venv .venv
+            .venv/bin/pip install --upgrade pip
+            .venv/bin/pip install -r requirements.txt
+          fi
 
       - name: Run Daily Grader
         working-directory: pipeline
