@@ -1,0 +1,152 @@
+name: Daily Sports Scraper
+
+on:
+  schedule:
+    # Runs at 08:10 UTC everyday (slightly offset to avoid peak traffic delays)
+    - cron: '10 8 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: daily-sports-scraper
+  cancel-in-progress: false
+
+# Public-runner edition (free minutes, sealed bundle) of the private repo's
+# sites_daily_pipeline.yml. Same sharding and AI-cache persistence; code is
+# unsealed from bundles/pipeline.seal into pipeline/ before running.
+jobs:
+  scrape-and-process:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    timeout-minutes: 150
+    env:
+      # Required Secrets
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      CEREBRAS_TOKEN: ${{ secrets.CEREBRAS_TOKEN }}
+      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+      # AI Provider Secrets
+      GROQ_TOKEN: ${{ secrets.GROQ_TOKEN }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+      MISTRAL_TOKEN: ${{ secrets.MISTRAL_TOKEN }}
+      SAMBANOVA_TOKEN: ${{ secrets.SAMBANOVA_TOKEN }}
+      TOGETHER_TOKEN: ${{ secrets.TOGETHER_TOKEN }}
+      DEEPSEEK_TOKEN: ${{ secrets.DEEPSEEK_TOKEN }}
+
+      # Grounded Gemini Enrichment
+      GEMINI_TOKEN: ${{ secrets.GEMINI_TOKEN }}
+
+      # Optimized Configuration
+      AI_PROVIDER: 'cerebras'
+      OPENROUTER_FREE_MODEL: 'nvidia/nemotron-3-super-120b-a12b:free'
+      OPENROUTER_BACKUP_MODEL: 'openrouter/free'
+      AI_USE_CHAINED_PROMPTS: 'true'
+      TARGET_TIMEZONE: 'US/Eastern'
+      LOG_LEVEL: 'INFO'
+      CI: 'true'
+
+    steps:
+      - name: Checkout Runner Repo
+        uses: actions/checkout@v4
+
+      - name: Verify + unseal pipeline bundle
+        env:
+          PIPELINE_SEAL_KEY: ${{ secrets.PIPELINE_SEAL_KEY }}
+        run: |
+          (cd bundles && sha256sum -c SHA256)
+          python3 -m pip install --user -q cryptography
+          python3 tools/unseal.py --in bundles/pipeline.seal --out /tmp/pipeline.tgz
+          mkdir -p pipeline
+          tar xzf /tmp/pipeline.tgz -C pipeline
+
+      - name: Set up Python 3.12
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: pipeline/requirements.txt
+
+      - name: Restore venv cache
+        id: venv-cache
+        uses: actions/cache@v4
+        with:
+          path: pipeline/.venv
+          key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('pipeline/requirements.txt') }}
+
+      # Persist the SQLite AI-standardization cache across runs. Scraped picks
+      # are heavily repetitive day-to-day, so a warm cache lets those picks
+      # skip the AI layers entirely.
+      - name: Restore AI standardization cache
+        id: ai-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: pipeline/data/ai_parsing_cache.db
+          key: ai-cache-v1-${{ github.run_id }}
+          restore-keys: |
+            ai-cache-v1-
+
+      - name: Validate Environment Secrets
+        run: |
+          echo "Verifying required production secrets..."
+          MISSING_SECRETS=0
+          if [ -z "${{ secrets.SUPABASE_URL }}" ]; then echo "::error::SUPABASE_URL is missing"; MISSING_SECRETS=1; fi
+          if [ -z "${{ secrets.SUPABASE_KEY }}" ]; then echo "::error::SUPABASE_KEY is missing"; MISSING_SECRETS=1; fi
+          if [ -z "${{ secrets.OPENROUTER_API_KEY }}" ]; then echo "::error::OPENROUTER_API_KEY is missing"; MISSING_SECRETS=1; fi
+          if [ -z "${{ secrets.CEREBRAS_TOKEN }}" ] && [ -z "${{ secrets.CEREBRAS_API_KEY }}" ]; then echo "::warning::CEREBRAS key is missing (using fallback)"; fi
+          if [ -z "${{ secrets.GROQ_TOKEN }}" ] && [ -z "${{ secrets.GROQ_API_KEY }}" ]; then echo "::warning::GROQ key is missing (using fallback)"; fi
+          if [ -z "${{ secrets.GEMINI_TOKEN }}" ]; then echo "::warning::GEMINI_TOKEN is missing (grounded enrichment disabled)"; fi
+
+          if [ $MISSING_SECRETS -eq 1 ]; then
+            echo "::error::One or more critical secrets are missing. Pipeline aborted."
+            exit 1
+          fi
+          echo "All critical secrets verified."
+
+      - name: Install Dependencies
+        working-directory: pipeline
+        run: |
+          if [ ! -f .venv/bin/python ] || ! .venv/bin/python -c "import sys" 2>/dev/null; then
+            echo "Virtual environment missing or broken, rebuilding..."
+            rm -rf .venv
+            python -m venv .venv
+            .venv/bin/pip install --upgrade pip
+            .venv/bin/pip install -r requirements.txt
+          fi
+
+      - name: Run Scraper Pipeline (Live Mode) - Shard ${{ matrix.shard }}
+        working-directory: pipeline
+        run: |
+          # 32 Workers per shard for optimal CPU/IO balance. Shards scrape
+          # non-overlapping cappers; both write the same cache DB.
+          .venv/bin/python sites/run_autonomous_cycle.py --live --workers 32 \
+            --shard-index ${{ matrix.shard }} --total-shards 2
+
+      # Guard: only attempt to save once the pipeline actually (re)wrote the
+      # cache DB. cache/save fails hard if the path is absent.
+      - name: Check AI cache DB exists
+        id: cache-exists
+        if: always() && matrix.shard == 0
+        run: |
+          if test -f pipeline/data/ai_parsing_cache.db; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only shard 0 saves: both shards write the same DB, and cache/save
+      # rejects a key that already exists in the run.
+      - name: Save AI standardization cache
+        if: always() && matrix.shard == 0 && steps.cache-exists.outputs.exists == 'true' && steps.ai-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: pipeline/data/ai_parsing_cache.db
+          key: ai-cache-v1-${{ github.run_id }}
