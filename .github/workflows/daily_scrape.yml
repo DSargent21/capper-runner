@@ -80,6 +80,9 @@ jobs:
             pipeline/cache/quota_ledger.json
             pipeline/cache/dead_letter.json
             pipeline/cache/heartbeat.json
+            pipeline/cache/source_volumes.json
+            pipeline/cache/settlement_sweep_state.json
+            pipeline/cache/reddit_sweep_state.json
           key: pipeline-state-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             pipeline-state-${{ runner.os }}-
@@ -104,9 +107,19 @@ jobs:
         working-directory: pipeline
         run: .venv/bin/python scripts/repair_capper_directory.py --check-only
 
-      - name: Run Scraper for Yesterday
+      - name: Reconcile Yesterday
+        # Cursorless next-day re-scan with a coverage verdict. Incremental
+        # "--yesterday" was not a completeness check: a cursor, a processed
+        # hash, or a staged resume could each hide a message the live ticks
+        # never ingested.
         working-directory: pipeline
-        run: .venv/bin/python cli.py --yesterday --incremental
+        env:
+          # Grading has its own daily job. The in-run settlement sweep used
+          # to burn the whole 30-min budget AFTER the scrape had succeeded.
+          SETTLEMENT_SWEEP_IN_RUN: "0"
+          TWITTER_MAX_PAGES: "8"
+          TWITTER_RECONCILE_MAX_PAGES: "20"
+        run: .venv/bin/python cli.py --reconcile
 
       - name: Audit Scrape Dates
         # Failure-isolated hard gate (plan W7): same audit the private repo
