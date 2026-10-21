@@ -72,6 +72,7 @@ jobs:
             pipeline/.vision_cache.json
             pipeline/.text_cache.json
             pipeline/.grounded_cache.json
+            pipeline/.web_evidence_cache.json
             pipeline/.jina_evidence_cache.json
             pipeline/.grading_results_cache.json
             pipeline/grading_resolution_cache.json
@@ -108,10 +109,63 @@ jobs:
         working-directory: pipeline
         run: .venv/bin/python scripts/quota_governor.py decide --job live
 
+      - name: Validate capper mappings (pre-flight)
+        # Best-effort on the live path: a transient Supabase hiccup must never
+        # stop collection (the daily run owns repairs, and upload quarantines
+        # dead rows). A REAL stale mapping is logged here before any fetch so
+        # the FK failure never eats a chunk of otherwise-good picks.
+        continue-on-error: true
+        working-directory: pipeline
+        run: |
+          .venv/bin/python scripts/repair_capper_directory.py --check-only \
+            || echo "pre-flight warning: capper map could not be verified - continuing (upload quarantines dead rows)."
+
       - name: Run Live Scraper
         if: steps.gov.outputs.run == 'true'
         working-directory: pipeline
         run: .venv/bin/python cli.py --live --source all --incremental
+
+      - name: Check recovery artifact files
+        id: artifact-check
+        if: always()
+        run: |
+          # Actions bills an upload step even when it finds nothing; live runs
+          # 8x/day, so gate both uploads on file existence.
+          has_quarantine=false
+          has_state=false
+          if [ -f pipeline/cache/quarantined_picks.json ] || [ -f pipeline/cache/failed_uploads.json ]; then
+            has_quarantine=true
+          fi
+          if [ -f pipeline/cache/attribution_memory.json ] || [ -f pipeline/.agent/capper_variants.json ]; then
+            has_state=true
+          fi
+          echo "has_quarantine=$has_quarantine" >> "$GITHUB_OUTPUT"
+          echo "has_state=$has_state" >> "$GITHUB_OUTPUT"
+
+      - name: Upload quarantined/fallback picks (durable recovery)
+        # The runner is ephemeral: without this, rows whose capper_id is dead
+        # at upload time vanish with the job instead of being re-filed after
+        # the map is repaired.
+        if: always() && steps.artifact-check.outputs.has_quarantine == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: quarantined-picks-${{ github.run_id }}
+          path: |
+            pipeline/cache/quarantined_picks.json
+            pipeline/cache/failed_uploads.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload learned attribution state (durable recovery)
+        if: always() && steps.artifact-check.outputs.has_state == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: learned-state-${{ github.run_id }}
+          path: |
+            pipeline/cache/attribution_memory.json
+            pipeline/.agent/capper_variants.json
+          if-no-files-found: ignore
+          retention-days: 30
 
       - name: Record heartbeat
         if: always()
