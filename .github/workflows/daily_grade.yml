@@ -2,6 +2,9 @@ name: Daily Grader
 
 on:
   schedule:
+    # Two free-only sweeps before the daily scrape/results settle; zero LLM.
+    - cron: '15 6 * * *'
+    - cron: '30 8 * * *'
     - cron: '0 11 * * *'   # 11:00 UTC = 7:00 AM EDT; grades the 08:00 scrape
   workflow_dispatch:
     inputs:
@@ -84,6 +87,9 @@ jobs:
         working-directory: pipeline
         run: |
           ARGS="--yesterday --review --review-window 3"
+          if [ "${{ github.event.schedule }}" = "15 6 * * *" ] || [ "${{ github.event.schedule }}" = "30 8 * * *" ]; then
+            ARGS="--yesterday --review --review-window 2 --free-only"
+          fi
           if [ "${{ github.event.inputs.drain }}" = "true" ]; then
             # --budget 4800: self-stop at 80 min, inside the 90-min job
             # timeout. A hard kill mid-date loses that date's graded batch
