@@ -1,0 +1,72 @@
+name: Re-seal current pipeline (one-off)
+
+# Temporary workflow. It decrypts the uploaded current bundle with a
+# short-lived key, then re-encrypts it with the runner's existing
+# PIPELINE_SEAL_KEY so the public runner can consume it. Nothing is printed
+# and the plaintext exists only on the ephemeral runner.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reseal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Runner Repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install crypto dependency
+        run: python3 -m pip install --quiet cryptography
+
+      - name: Decrypt uploaded current bundle (temporary key)
+        env:
+          PIPELINE_PATCH_KEY: ${{ secrets.PIPELINE_PATCH_KEY }}
+        run: |
+          python3 tools/unseal.py \
+            --in bundles/pipeline.new.seal \
+            --out /tmp/pipeline.tgz \
+            --key-env PIPELINE_PATCH_KEY
+          mkdir -p /tmp/pipeline
+          tar xzf /tmp/pipeline.tgz -C /tmp/pipeline
+
+      - name: Re-encrypt with the runner key
+        env:
+          PIPELINE_SEAL_KEY: ${{ secrets.PIPELINE_SEAL_KEY }}
+        run: |
+          python3 - <<'PY' > /tmp/recipient.txt
+          import base64, os
+          from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+          raw = base64.urlsafe_b64decode(os.environ["PIPELINE_SEAL_KEY"].strip().encode())
+          priv = X25519PrivateKey.from_private_bytes(raw)
+          print(base64.urlsafe_b64encode(priv.public_key().public_bytes_raw()).decode())
+          PY
+          python3 /tmp/pipeline/scripts/seal_and_ship.py seal \
+            --in /tmp/pipeline.tgz \
+            --out /tmp/pipeline.seal \
+            --recipient "$(cat /tmp/recipient.txt)"
+          python3 /tmp/pipeline/scripts/seal_and_ship.py verify \
+            --in /tmp/pipeline.seal >/dev/null
+          python3 - <<'PY' > /tmp/SHA256
+          import hashlib
+          print(hashlib.sha256(open("/tmp/pipeline.seal", "rb").read()).hexdigest() + "  pipeline.seal")
+          PY
+
+      - name: Upload re-sealed bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: resealed-pipeline
+          path: |
+            /tmp/pipeline.seal
+            /tmp/SHA256
+          if-no-files-found: error
+          retention-days: 1
