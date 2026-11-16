@@ -15,7 +15,7 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -124,6 +124,18 @@ jobs:
         if: steps.gov.outputs.run == 'true'
         working-directory: pipeline
         run: .venv/bin/python cli.py --live --source all --incremental
+
+      - name: Fill missing opponents (intraday)
+        # Cards name one side, so extraction can store "vs TBD". Resolve the
+        # subject against the same free ESPN boards the grader uses; today +
+        # tomorrow only. Best-effort: a healing failure must not fail live.
+        if: steps.gov.outputs.run == 'true'
+        continue-on-error: true
+        working-directory: pipeline
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: .venv/bin/python scripts/backfill_pick_opponents.py --days 1 --window 1 --apply
 
       - name: Check recovery artifact files
         id: artifact-check

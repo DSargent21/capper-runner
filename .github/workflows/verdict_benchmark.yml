@@ -1,0 +1,156 @@
+name: Verdict Benchmark
+
+# Weekly verdict-QUALITY gate. Grades a frozen sample of officially settled
+# picks through the real production path and fails when accuracy drops below
+# the recorded floor. The pipeline is sealed; no source is stored here.
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      min_accuracy:
+        description: 'Override the accuracy floor (0-1). Empty = frozen sample floor.'
+        required: false
+        type: string
+      rebaseline:
+        description: 'Measure with --update-baseline and upload the fixture to commit by hand.'
+        type: boolean
+        default: false
+
+concurrency:
+  group: verdict-benchmark
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Frozen verdict accuracy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Runner Repo
+        uses: actions/checkout@v4
+
+      - name: Verify + unseal pipeline bundle
+        env:
+          PIPELINE_SEAL_KEY: ${{ secrets.PIPELINE_SEAL_KEY }}
+        run: |
+          (cd bundles && sha256sum -c SHA256)
+          python3 -m pip install --user -q cryptography
+          python3 tools/unseal.py --in bundles/pipeline.seal --out /tmp/pipeline.tgz
+          mkdir -p pipeline
+          tar xzf /tmp/pipeline.tgz -C pipeline
+
+      - name: Set up Python 3.12
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: pipeline/requirements.txt
+
+      - name: Restore venv cache
+        uses: actions/cache@v4
+        with:
+          path: pipeline/.venv
+          key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('pipeline/requirements.txt') }}
+
+      - name: Install Dependencies
+        working-directory: pipeline
+        run: |
+          if [ ! -f .venv/bin/python ] || ! .venv/bin/python -c "import sys" 2>/dev/null; then
+            echo "Virtual environment missing or broken, rebuilding..."
+            rm -rf .venv
+            python -m venv .venv
+            .venv/bin/pip install --upgrade pip
+            .venv/bin/pip install -r requirements.txt
+          fi
+
+      - name: Verify the scoring contract (no model calls)
+        working-directory: pipeline
+        run: |
+          .venv/bin/python -c "import pytest" 2>/dev/null || \
+            .venv/bin/pip install -q pytest
+          .venv/bin/python -m pytest tests/test_verdict_benchmark.py -q
+
+      - name: Run verdict benchmark
+        id: bench
+        working-directory: pipeline
+        env:
+          GEMINI_TOKEN: ${{ secrets.GEMINI_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+        run: |
+          set -o pipefail
+          ARGS=()
+          if [ -n "${{ inputs.min_accuracy }}" ]; then
+            ARGS+=(--min-accuracy "${{ inputs.min_accuracy }}")
+          fi
+          if [ "${{ inputs.rebaseline }}" = "true" ]; then
+            ARGS+=(--update-baseline)
+          fi
+          echo "Running: verdict_benchmark.py ${ARGS[*]}"
+          .venv/bin/python scripts/verdict_benchmark.py "${ARGS[@]}" 2>&1 | tee verdict_benchmark.log
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+        continue-on-error: true
+
+      - name: Record result in the job summary
+        if: always()
+        working-directory: pipeline
+        run: |
+          {
+            echo "## Verdict benchmark"
+            echo
+            echo '```'
+            grep -E "VerdictBench|MISS" verdict_benchmark.log || echo "no benchmark output"
+            echo '```'
+            echo
+            case "${{ steps.bench.outputs.rc }}" in
+              0) echo "Result: **within the gate**." ;;
+              1) echo "Result: **BELOW the accuracy floor** — grade quality regressed." ;;
+              2) echo "Result: **materially above the recorded baseline** — rebaseline and commit the fixture." ;;
+              3) echo "Result: **nothing scored** — no verdict-capable provider answered, or all cases abstained. Not a pass." ;;
+              *) echo "Result: benchmark crashed (exit ${{ steps.bench.outputs.rc }})." ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verdict-benchmark-log
+          path: pipeline/verdict_benchmark.log
+          if-no-files-found: ignore
+
+      - name: Upload rebaselined fixture
+        if: always() && inputs.rebaseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: verdict-baseline-cases
+          path: pipeline/scripts/verdict_baseline_cases.json
+          if-no-files-found: warn
+
+      - name: Gate
+        if: always()
+        run: |
+          rc="${{ steps.bench.outputs.rc }}"
+          if [ "$rc" = "0" ]; then
+            echo "Verdict benchmark passed."
+            exit 0
+          fi
+          if [ "$rc" = "2" ]; then
+            echo "::error::Verdict benchmark is materially above its baseline; rebaseline and commit the fixture."
+          else
+            echo "::error::Verdict benchmark failed (exit $rc) — see the summary above."
+          fi
+          exit 1
